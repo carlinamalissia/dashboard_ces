@@ -732,6 +732,7 @@ def get_mutuales(
 @app.get("/resumen")
 def get_resumen(
     periodo: Optional[str] = None,
+    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
     agrupar: Optional[str] = Query(None, description="mutual = agrupar por financiador"),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
@@ -800,6 +801,7 @@ def get_resumen(
 @app.get("/resumen/detalle")
 def get_resumen_detalle(
     periodo: Optional[str] = None,
+    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
     clinicas_ids: Optional[str] = Query(None),
     mutuales_ids: Optional[str] = Query(None),
     tipo: Optional[str] = None,
@@ -1149,8 +1151,8 @@ def version():
     """Endpoint para verificar qué versión está corriendo."""
     return {"version": "2026-04-17-periodos-ids", "analisis_practicas": "uses apply_clinica_filter + periodos_ids"}
 
-@app.get("/health")  
-def health():  # v2
+@app.get("/health")
+def health():
     with db_conn() as c:
         periodos = c.execute(
             "SELECT COUNT(*) as n, MAX(periodo) as ultimo FROM cargas"
