@@ -1,3 +1,4 @@
+# v2
 """
 CES Dashboard — Backend
 FastAPI + SQLite + JWT
