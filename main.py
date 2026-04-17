@@ -1149,8 +1149,8 @@ def version():
     """Endpoint para verificar qué versión está corriendo."""
     return {"version": "2026-04-17-periodos-ids", "analisis_practicas": "uses apply_clinica_filter + periodos_ids"}
 
-@app.get("/health")
-def health():
+@app.get("/health")  
+def health():  # v2
     with db_conn() as c:
         periodos = c.execute(
             "SELECT COUNT(*) as n, MAX(periodo) as ultimo FROM cargas"
