@@ -5,6 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+# force rebuild v2
 
 # Railway monta el volumen en /data
 RUN mkdir -p /data
