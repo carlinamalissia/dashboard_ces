@@ -1158,8 +1158,9 @@ def check_db():
 
 @app.post("/admin/fix-db", dependencies=[Depends(require_admin)])
 def fix_db():
-    """Crea tablas faltantes sin tocar datos existentes."""
+    """Crea tablas faltantes, elimina triggers problemáticos, diagnóstico completo."""
     with db_conn() as c:
+        # Crear tabla permisos si no existe
         c.executescript("""
             CREATE TABLE IF NOT EXISTS permisos (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1169,7 +1170,21 @@ def fix_db():
                 UNIQUE(usuario_id, clinica_id)
             );
         """)
-    return {"ok": True, "msg": "Tabla permisos creada/verificada"}
+        # Listar y eliminar todos los triggers
+        triggers = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"
+        ).fetchall()
+        for t in triggers:
+            c.execute(f"DROP TRIGGER IF EXISTS [{t['name']}]")
+        # Todos los objetos para diagnóstico
+        all_objects = c.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    return {
+        "ok": True,
+        "triggers_eliminados": [t["name"] for t in triggers],
+        "all_objects": [{"type": o["type"], "name": o["name"], "sql": o["sql"]} for o in all_objects]
+    }
 
 @app.get("/health")
 def health():
