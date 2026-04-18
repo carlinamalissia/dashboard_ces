@@ -27,7 +27,7 @@ TOKEN_HOURS = int(os.getenv("TOKEN_HOURS", "12"))
 DB_PATH     = os.getenv("DB_PATH", "/data/ces.db")   # Railway volume
 ADMIN_USER  = os.getenv("ADMIN_USER", "admin")
 # bcrypt tiene límite de 72 bytes — truncamos por si la contraseña es larga
-ADMIN_PASS  = os.getenv("ADMIN_PASS", "Gea2026$$$$")[:72]
+ADMIN_PASS  = os.getenv("ADMIN_PASS", "Ces2026")[:72]
 
 # Columnas requeridas en el Excel consolidado
 REQUIRED_COLS = {
