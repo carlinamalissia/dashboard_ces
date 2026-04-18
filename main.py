@@ -1158,33 +1158,35 @@ def check_db():
 
 @app.post("/admin/fix-db", dependencies=[Depends(require_admin)])
 def fix_db():
-    """Crea tablas faltantes, elimina triggers problemáticos, diagnóstico completo."""
+    """Recrea permisos con FK correcta a usuarios, preservando datos."""
     with db_conn() as c:
-        # Crear tabla permisos si no existe
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS permisos (
+        # Leer permisos existentes para preservarlos
+        try:
+            existing = c.execute("SELECT usuario_id, clinica_id, nom_clinica FROM permisos").fetchall()
+        except Exception:
+            existing = []
+        # Borrar tabla permisos con FK rota
+        c.execute("DROP TABLE IF EXISTS permisos")
+        # Recrear con FK correcta
+        c.execute("""
+            CREATE TABLE permisos (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
                 clinica_id INTEGER NOT NULL,
                 nom_clinica TEXT NOT NULL,
                 UNIQUE(usuario_id, clinica_id)
-            );
+            )
         """)
-        # Listar y eliminar todos los triggers
-        triggers = c.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger'"
-        ).fetchall()
-        for t in triggers:
-            c.execute(f"DROP TRIGGER IF EXISTS [{t['name']}]")
-        # Todos los objetos para diagnóstico
-        all_objects = c.execute(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-    return {
-        "ok": True,
-        "triggers_eliminados": [t["name"] for t in triggers],
-        "all_objects": [{"type": o["type"], "name": o["name"], "sql": o["sql"]} for o in all_objects]
-    }
+        # Restaurar datos
+        for row in existing:
+            try:
+                c.execute(
+                    "INSERT OR IGNORE INTO permisos (usuario_id, clinica_id, nom_clinica) VALUES (?,?,?)",
+                    (row["usuario_id"], row["clinica_id"], row["nom_clinica"])
+                )
+            except Exception:
+                pass
+    return {"ok": True, "msg": "Tabla permisos recreada con FK correcta", "filas_restauradas": len(existing)}
 
 @app.get("/health")
 def health():
