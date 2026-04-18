@@ -1141,6 +1141,21 @@ def version():
     return {"version": "2026-04-17-periodos-ids", "analisis_practicas": "uses apply_clinica_filter + periodos_ids"}
 
 
+
+@app.get("/admin/check-db", dependencies=[Depends(require_admin)])
+def check_db():
+    """Diagnóstico: lista tablas y columnas de la BD."""
+    with db_conn() as c:
+        tables = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        result = {}
+        for t in tables:
+            tname = t["name"]
+            cols = c.execute(f"PRAGMA table_info({tname})").fetchall()
+            result[tname] = [col["name"] for col in cols]
+    return {"db": DB_PATH, "tables": result}
+
 @app.post("/admin/fix-db", dependencies=[Depends(require_admin)])
 def fix_db():
     """Crea tablas faltantes sin tocar datos existentes."""
