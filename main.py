@@ -1140,6 +1140,22 @@ def version():
     """Endpoint para verificar qué versión está corriendo."""
     return {"version": "2026-04-17-periodos-ids", "analisis_practicas": "uses apply_clinica_filter + periodos_ids"}
 
+
+@app.post("/admin/fix-db", dependencies=[Depends(require_admin)])
+def fix_db():
+    """Crea tablas faltantes sin tocar datos existentes."""
+    with db_conn() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS permisos (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                clinica_id INTEGER NOT NULL,
+                nom_clinica TEXT NOT NULL,
+                UNIQUE(usuario_id, clinica_id)
+            );
+        """)
+    return {"ok": True, "msg": "Tabla permisos creada/verificada"}
+
 @app.get("/health")
 def health():
     with db_conn() as c:
