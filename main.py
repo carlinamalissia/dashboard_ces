@@ -151,6 +151,23 @@ def init_db():
             nombre_archivo TEXT
         );
 
+        -- Migration: recreate usuarios table if it doesn't support 'directorio' role
+        -- This runs safely even if already migrated
+        CREATE TABLE IF NOT EXISTS usuarios_new (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            username  TEXT UNIQUE NOT NULL,
+            nombre    TEXT NOT NULL,
+            hash_pass TEXT NOT NULL,
+            rol       TEXT NOT NULL CHECK(rol IN ('admin','directorio','interno','prestador')),
+            activo    INTEGER NOT NULL DEFAULT 1,
+            creado    TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO usuarios_new SELECT * FROM usuarios WHERE rol IN ('admin','directorio','interno','prestador');
+        DROP TABLE IF EXISTS usuarios_old;
+        ALTER TABLE usuarios RENAME TO usuarios_old;
+        ALTER TABLE usuarios_new RENAME TO usuarios;
+        DROP TABLE IF EXISTS usuarios_old;
+
         """)
         # Admin por defecto
         pwd = _bcrypt.hashpw(ADMIN_PASS[:72].encode(), _bcrypt.gensalt()).decode()
@@ -866,13 +883,19 @@ def get_kpis(
                 COALESCE(SUM(liquida), 0) as liquida_total,
                 SUM(CASE WHEN tipo='AMB' THEN 1 ELSE 0 END) as filas_amb,
                 SUM(CASE WHEN tipo='INT' THEN 1 ELSE 0 END) as filas_int,
+                COALESCE(SUM(CASE WHEN tipo='AMB' THEN importe ELSE 0 END), 0) as importe_amb,
+                COALESCE(SUM(CASE WHEN tipo='INT' THEN importe ELSE 0 END), 0) as importe_int,
+                COALESCE(SUM(CASE WHEN tipo='AMB' THEN liquida ELSE 0 END), 0) as liquida_amb,
+                COALESCE(SUM(CASE WHEN tipo='INT' THEN liquida ELSE 0 END), 0) as liquida_int,
                 SUM(CASE WHEN anio_anterior='SÍ' THEN 1 ELSE 0 END) as anio_anterior
             FROM prestaciones WHERE {where}
         """, params).fetchone()
     d = dict(r)
     if user["rol"] not in ("admin", "directorio"):
         d["importe_total"] = None
-        # liquida_total visible for all roles
+        d["importe_amb"] = None
+        d["importe_int"] = None
+        # liquida visible for all roles
     return d
 
 @app.get("/desfase")
