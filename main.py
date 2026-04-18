@@ -151,23 +151,6 @@ def init_db():
             nombre_archivo TEXT
         );
 
-        -- Migration: recreate usuarios table if it doesn't support 'directorio' role
-        -- This runs safely even if already migrated
-        CREATE TABLE IF NOT EXISTS usuarios_new (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            username  TEXT UNIQUE NOT NULL,
-            nombre    TEXT NOT NULL,
-            hash_pass TEXT NOT NULL,
-            rol       TEXT NOT NULL CHECK(rol IN ('admin','directorio','interno','prestador')),
-            activo    INTEGER NOT NULL DEFAULT 1,
-            creado    TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        INSERT OR IGNORE INTO usuarios_new SELECT * FROM usuarios WHERE rol IN ('admin','directorio','interno','prestador');
-        DROP TABLE IF EXISTS usuarios_old;
-        ALTER TABLE usuarios RENAME TO usuarios_old;
-        ALTER TABLE usuarios_new RENAME TO usuarios;
-        DROP TABLE IF EXISTS usuarios_old;
-
         """)
         # Admin por defecto
         pwd = _bcrypt.hashpw(ADMIN_PASS[:72].encode(), _bcrypt.gensalt()).decode()
