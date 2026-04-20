@@ -11,7 +11,7 @@ import bcrypt as _bcrypt
 import pandas as pd
 from fastapi import (
     FastAPI, Depends, HTTPException, UploadFile, File,
-    status, Query, Response
+    status, Query, Response, Request
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -24,12 +24,10 @@ from pydantic import BaseModel
 SECRET_KEY  = os.getenv("SECRET_KEY", secrets.token_hex(32))
 ALGORITHM   = "HS256"
 TOKEN_HOURS = int(os.getenv("TOKEN_HOURS", "12"))
-DB_PATH     = os.getenv("DB_PATH", "/data/ces.db")   # Railway volume
+DB_PATH     = os.getenv("DB_PATH", "/data/ces.db")
 ADMIN_USER  = os.getenv("ADMIN_USER", "admin")
-# bcrypt tiene límite de 72 bytes — truncamos por si la contraseña es larga
 ADMIN_PASS  = os.getenv("ADMIN_PASS", "Ces2026")[:72]
 
-# Columnas requeridas en el Excel consolidado
 REQUIRED_COLS = {
     "TIPO", "PERIODO", "FECHA_REF", "MES_PRESTACION",
     "DESFASE_MESES", "ANIO_ANTERIOR",
@@ -151,8 +149,18 @@ def init_db():
             nombre_archivo TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS login_logs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            username   TEXT NOT NULL,
+            ip         TEXT,
+            exito      INTEGER NOT NULL DEFAULT 0,
+            motivo     TEXT,
+            fecha      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_logs_fecha ON login_logs(fecha DESC);
+        CREATE INDEX IF NOT EXISTS idx_logs_user  ON login_logs(username);
         """)
-        # Admin por defecto
         pwd = _bcrypt.hashpw(ADMIN_PASS[:72].encode(), _bcrypt.gensalt()).decode()
         c.execute("""
             INSERT OR IGNORE INTO usuarios (username, nombre, hash_pass, rol)
@@ -201,15 +209,21 @@ def require_admin(user=Depends(get_current_user)):
     return user
 
 def require_admin_or_interno(user=Depends(get_current_user)):
-    # prestador e interno pueden consultar; solo admin puede admin
     return user
 
 def get_clinicas_usuario(uid: int) -> Optional[List[int]]:
-    """None = sin restricción (admin). Lista = clínicas permitidas."""
+    """
+    None = sin restricción (admin, directorio, interno/gerentes).
+    Lista = clínicas permitidas (solo prestador).
+    """
     with db_conn() as c:
         rol = c.execute("SELECT rol FROM usuarios WHERE id=?", (uid,)).fetchone()
-        if not rol or rol["rol"] in ("admin", "directorio"):
+        if not rol:
+            return []
+        # admin, directorio e interno (gerentes) ven todo sin restricción de clínica
+        if rol["rol"] in ("admin", "directorio", "interno"):
             return None
+        # prestador: restringido a clínicas asignadas
         rows = c.execute(
             "SELECT clinica_id FROM permisos WHERE usuario_id=?", (uid,)
         ).fetchall()
@@ -217,7 +231,6 @@ def get_clinicas_usuario(uid: int) -> Optional[List[int]]:
 
 
 def parse_ids(ids_str: Optional[str], allowed: Optional[List[int]] = None) -> Optional[List[int]]:
-    """Parse comma-separated IDs string. Returns None if empty, filtered list otherwise."""
     if not ids_str:
         return None
     ids = [int(x) for x in ids_str.split(",") if x.strip().isdigit()]
@@ -227,9 +240,8 @@ def parse_ids(ids_str: Optional[str], allowed: Optional[List[int]] = None) -> Op
         ids = [i for i in ids if i in allowed]
     return ids or None
 
-def apply_clinica_filter(where: str, params: list, clinicas_ids: Optional[str], 
+def apply_clinica_filter(where: str, params: list, clinicas_ids: Optional[str],
                           clinica: Optional[int], user_clinicas: Optional[List[int]]) -> tuple:
-    """Apply clinica filter respecting user permissions. Returns (where, params)."""
     cids = []
     if clinicas_ids:
         cids = [int(x) for x in clinicas_ids.split(",") if x.strip().isdigit()]
@@ -245,7 +257,6 @@ def apply_clinica_filter(where: str, params: list, clinicas_ids: Optional[str],
     return where, params
 
 def apply_periodo_filter(where: str, params: list, periodos_ids: Optional[str], periodo: Optional[str]) -> tuple:
-    """Apply periodo filter — accepts comma-separated periods OR single period."""
     all_periods = []
     if periodos_ids:
         all_periods = [x.strip() for x in periodos_ids.split(",") if x.strip()]
@@ -257,10 +268,8 @@ def apply_periodo_filter(where: str, params: list, periodos_ids: Optional[str], 
         params.extend(all_periods)
     return where, params
 
-
-def apply_mutual_filter(where: str, params: list, mutuales_ids: Optional[str], 
+def apply_mutual_filter(where: str, params: list, mutuales_ids: Optional[str],
                         mutual: Optional[int]) -> tuple:
-    """Apply mutual filter. Returns (where, params)."""
     mids = []
     if mutuales_ids:
         mids = [int(x) for x in mutuales_ids.split(",") if x.strip().isdigit()]
@@ -271,6 +280,13 @@ def apply_mutual_filter(where: str, params: list, mutuales_ids: Optional[str],
         where += f" AND mutual IN ({phs})"
         params.extend(mids)
     return where, params
+
+def get_client_ip(request: Request) -> str:
+    """Extrae la IP real del cliente considerando proxies."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 # ─────────────────────────────────────────────────────────────
 # PYDANTIC SCHEMAS
@@ -284,7 +300,7 @@ class UsuarioCreate(BaseModel):
     username: str
     nombre: str
     password: str
-    rol: str   # admin | directorio | interno | prestador
+    rol: str
 
 class UsuarioUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -324,7 +340,7 @@ app = FastAPI(title="CES Dashboard API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En prod: restringir al dominio del frontend
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -337,13 +353,30 @@ def startup():
 # AUTH ENDPOINTS
 # ─────────────────────────────────────────────────────────────
 @app.post("/auth/token", response_model=TokenOut)
-def login(form: OAuth2PasswordRequestForm = Depends()):
+def login(request: Request, form: OAuth2PasswordRequestForm = Depends()):
+    ip = get_client_ip(request)
     with db_conn() as c:
         u = c.execute(
             "SELECT * FROM usuarios WHERE username=? AND activo=1", (form.username,)
         ).fetchone()
+
     if not u or not verify_password(form.password, u["hash_pass"]):
+        # Registrar intento fallido
+        motivo = "usuario_no_encontrado" if not u else "password_incorrecto"
+        with db_conn() as c:
+            c.execute(
+                "INSERT INTO login_logs (username, ip, exito, motivo) VALUES (?,?,0,?)",
+                (form.username, ip, motivo)
+            )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciales incorrectas")
+
+    # Registrar login exitoso
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO login_logs (username, ip, exito, motivo) VALUES (?,?,1,'ok')",
+            (u["username"], ip)
+        )
+
     token = make_token({"uid": u["id"], "rol": u["rol"]})
     return {
         "access_token": token,
@@ -356,10 +389,48 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
 @app.get("/auth/me")
 def me(user=Depends(get_current_user)):
     d = {k: v for k, v in user.items() if k != "hash_pass"}
-    d["show_money"]   = user["rol"] in ("admin", "directorio")
-    d["show_liquida"] = True  # all authenticated roles see liquida
-    d["can_admin"]    = user["rol"] == "admin"
+    rol = user["rol"]
+    d["show_money"]   = rol in ("admin", "directorio")
+    # interno (gerentes) ve A LIQUIDAR pero NO IMPORTE
+    d["show_liquida"] = True
+    d["show_importe"] = rol in ("admin", "directorio")
+    d["can_admin"]    = rol == "admin"
+    # interno ve todos los prestadores y financiadores (sin restricción de clínica)
+    d["all_prestadores"] = rol in ("admin", "directorio", "interno")
     return d
+
+# ─────────────────────────────────────────────────────────────
+# LOGIN LOGS (admin only)
+# ─────────────────────────────────────────────────────────────
+@app.get("/admin/login-logs", dependencies=[Depends(require_admin)])
+def get_login_logs(
+    limit: int = Query(200, le=1000),
+    offset: int = 0,
+    username: Optional[str] = None,
+    solo_fallidos: bool = False
+):
+    """Registro de intentos de login — solo admins."""
+    params = []
+    where = "1=1"
+    if username:
+        where += " AND username LIKE ?"
+        params.append(f"%{username}%")
+    if solo_fallidos:
+        where += " AND exito=0"
+    with db_conn() as c:
+        total = c.execute(
+            f"SELECT COUNT(*) FROM login_logs WHERE {where}", params
+        ).fetchone()[0]
+        rows = c.execute(
+            f"SELECT * FROM login_logs WHERE {where} ORDER BY fecha DESC LIMIT ? OFFSET ?",
+            params + [limit, offset]
+        ).fetchall()
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "data": [dict(r) for r in rows]
+    }
 
 # ─────────────────────────────────────────────────────────────
 # USUARIOS (admin only)
@@ -463,7 +534,6 @@ def remove_permiso(uid: int, clinica_id: int):
 
 @app.put("/usuarios/{uid}/permisos", dependencies=[Depends(require_admin)])
 def set_permisos(uid: int, body: List[PermisoIn]):
-    """Reemplaza todos los permisos del usuario de una vez."""
     with db_conn() as c:
         c.execute("DELETE FROM permisos WHERE usuario_id=?", (uid,))
         for p in body:
@@ -478,7 +548,6 @@ def set_permisos(uid: int, body: List[PermisoIn]):
 # ─────────────────────────────────────────────────────────────
 @app.post("/auth/change-password")
 def change_my_password(body: ChangePasswordSelf, user=Depends(get_current_user)):
-    """Cualquier usuario (no admin) puede cambiar su propia contraseña confirmando la actual."""
     if user["rol"] == "admin":
         raise HTTPException(400, "El admin cambia su contraseña desde Railway (variable ADMIN_PASS)")
     if len(body.password_nuevo.strip()) < 6:
@@ -494,7 +563,6 @@ def change_my_password(body: ChangePasswordSelf, user=Depends(get_current_user))
 
 @app.post("/usuarios/{uid}/change-password", dependencies=[Depends(require_admin)])
 def admin_change_password(uid: int, body: ChangePasswordAdmin):
-    """Admin puede cambiar la contraseña de cualquier usuario (no admin)."""
     with db_conn() as c:
         row = c.execute("SELECT rol FROM usuarios WHERE id=?", (uid,)).fetchone()
     if not row:
@@ -538,7 +606,7 @@ COL_MAP = {
 @app.post("/carga/upload")
 def upload_excel(
     file: UploadFile = File(...),
-    reemplazar: bool = Query(False, description="Si True, borra el período antes de insertar"),
+    reemplazar: bool = Query(False),
     user=Depends(require_admin)
 ):
     if not file.filename.endswith((".xlsx", ".xls")):
@@ -546,32 +614,27 @@ def upload_excel(
     content = file.file.read()
     try:
         xl = pd.ExcelFile(io.BytesIO(content))
-        # Preferir hoja "Consolidado", si no existe usar la primera hoja
         sheet = "Consolidado" if "Consolidado" in xl.sheet_names else xl.sheet_names[0]
         df = pd.read_excel(io.BytesIO(content), sheet_name=sheet, dtype=str)
     except Exception as e:
         raise HTTPException(400, f"No se pudo leer el archivo: {e}")
 
-    # Validar columnas mínimas
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
         raise HTTPException(400, f"Columnas faltantes: {', '.join(sorted(missing))}")
 
     df = df.where(pd.notna(df), None)
 
-    # Detectar períodos — los XLS históricos pueden tener varios
     periodos_en_archivo = sorted(set(
         str(p).strip() for p in df["PERIODO"].dropna().unique()
     ))
     if not periodos_en_archivo:
         raise HTTPException(400, "La columna PERIODO está vacía")
 
-    # Para el registro de carga usamos el primero (o el único)
     periodo_registro = periodos_en_archivo[0] if len(periodos_en_archivo) == 1 \
                        else f"{periodos_en_archivo[0]}..{periodos_en_archivo[-1]}"
 
     with db_conn() as c:
-        # Verificar períodos que ya existen
         conflictos = []
         for p in periodos_en_archivo:
             row = c.execute("SELECT filas FROM cargas WHERE periodo=?", (p,)).fetchone()
@@ -588,10 +651,7 @@ def upload_excel(
                 c.execute("DELETE FROM prestaciones WHERE periodo=?", (p,))
                 c.execute("DELETE FROM cargas WHERE periodo=?", (p,))
 
-        # Alias para el bloque de inserción
         periodo = periodo_registro
-
-        # Insertar filas
         db_cols = list(COL_MAP.values())
         placeholders = ",".join(["?"] * len(db_cols))
         insert_sql = f"INSERT INTO prestaciones ({','.join(db_cols)}) VALUES ({placeholders})"
@@ -614,7 +674,6 @@ def upload_excel(
 
         c.executemany(insert_sql, rows_to_insert)
 
-        # Registrar una entrada en cargas por cada período detectado
         conteo_periodos = df.groupby("PERIODO").size().to_dict()
         for p, n in conteo_periodos.items():
             p = str(p).strip()
@@ -651,11 +710,10 @@ def delete_periodo(periodo: str):
 # CONSULTAS
 # ─────────────────────────────────────────────────────────────
 def clinica_filter(clinicas: Optional[List[int]]) -> tuple:
-    """Devuelve (sql_fragment, params) para filtrar por clínicas."""
     if clinicas is None:
         return ("", [])
     if not clinicas:
-        return (" AND 1=0", [])  # sin permisos = nada
+        return (" AND 1=0", [])
     placeholders = ",".join(["?"] * len(clinicas))
     return (f" AND clinica IN ({placeholders})", clinicas)
 
@@ -672,7 +730,6 @@ def get_periodos(user=Depends(get_current_user)):
 
 @app.get("/clinicas")
 def get_clinicas(user=Depends(get_current_user)):
-    """Clínicas visibles para el usuario."""
     clinicas = get_clinicas_usuario(user["id"])
     if clinicas is None:
         with db_conn() as c:
@@ -691,7 +748,7 @@ def get_clinicas(user=Depends(get_current_user)):
 @app.get("/mutuales")
 def get_mutuales(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     user=Depends(get_current_user)
 ):
@@ -715,8 +772,8 @@ def get_mutuales(
 @app.get("/resumen")
 def get_resumen(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
-    agrupar: Optional[str] = Query(None, description="mutual = agrupar por financiador"),
+    periodos_ids: Optional[str] = Query(None),
+    agrupar: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = None,
@@ -725,7 +782,6 @@ def get_resumen(
     mes_prestacion: Optional[str] = None,
     user=Depends(get_current_user)
 ):
-    """KPIs y resumen agrupado por período + clínica + tipo."""
     clinicas = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas)
     params = []
@@ -738,7 +794,9 @@ def get_resumen(
     where, params = apply_mutual_filter(where, params, mutuales_ids, mutual)
 
     show_money = user["rol"] in ("admin", "directorio")
-    # Mutual grouping mode
+    # interno ve liquida pero no importe
+    show_liquida = True
+
     if agrupar == "mutual":
         with db_conn() as c:
             rows = c.execute(f"""
@@ -756,6 +814,7 @@ def get_resumen(
             if not show_money: d["importe_total"] = None
             result.append(d)
         return result
+
     with db_conn() as c:
         rows = c.execute(f"""
             SELECT
@@ -784,13 +843,12 @@ def get_resumen(
 @app.get("/resumen/detalle")
 def get_resumen_detalle(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinicas_ids: Optional[str] = Query(None),
     mutuales_ids: Optional[str] = Query(None),
     tipo: Optional[str] = None,
     user=Depends(get_current_user)
 ):
-    """Detalle drill-down: dado clínica devuelve financiadores; dado financiador devuelve clínicas."""
     clinicas_usuario = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas_usuario)
     params = []; where = f"1=1{cf}"; params.extend(cp)
@@ -801,8 +859,6 @@ def get_resumen_detalle(
 
     show_money = user["rol"] in ("admin", "directorio")
 
-    # If filtering by clinica → return financiadores breakdown
-    # If filtering by mutual → return clinicas breakdown
     if clinicas_ids and not mutuales_ids:
         with db_conn() as c:
             rows = c.execute(f"""
@@ -835,7 +891,7 @@ def get_resumen_detalle(
 @app.get("/kpis")
 def get_kpis(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = None,
@@ -843,7 +899,6 @@ def get_kpis(
     tipo: Optional[str] = None,
     user=Depends(get_current_user)
 ):
-    """Totales para la cabecera del dashboard."""
     clinicas = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas)
     params = []
@@ -878,13 +933,12 @@ def get_kpis(
         d["importe_total"] = None
         d["importe_amb"] = None
         d["importe_int"] = None
-        # liquida visible for all roles
     return d
 
 @app.get("/desfase")
 def get_desfase(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = None,
@@ -892,7 +946,6 @@ def get_desfase(
     tipo: Optional[str] = None,
     user=Depends(get_current_user)
 ):
-    """Distribución de desfase para el gráfico."""
     clinicas = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas)
     params = []
@@ -919,7 +972,7 @@ def get_desfase(
 @app.get("/detalle")
 def get_detalle(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = None,
@@ -933,7 +986,6 @@ def get_detalle(
     offset: int = 0,
     user=Depends(get_current_user)
 ):
-    """Tabla detalle paginada."""
     clinicas = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas)
     params = []
@@ -952,10 +1004,9 @@ def get_detalle(
         total = c.execute(
             f"SELECT COUNT(*) FROM prestaciones WHERE {where}", params
         ).fetchone()[0]
-        # importe solo para admin y directorio; liquida visible para todos
         show_money = user["rol"] in ("admin", "directorio")
         money_cols = "importe," if show_money else "NULL as importe,"
-        money_cols += " liquida,"  # all roles see liquida
+        money_cols += " liquida,"
         rows = c.execute(
             f"""SELECT id, periodo, tipo, fecha_ref, mes_prestacion, desfase_meses,
                        anio_anterior, lote, clinica, nom_clinica, mutual, nom_mutual,
@@ -981,7 +1032,7 @@ def get_detalle(
 @app.get("/descarga/excel")
 def download_excel(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = None,
     clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = None,
@@ -992,7 +1043,6 @@ def download_excel(
     solo_anio_anterior: bool = False,
     user=Depends(get_current_user)
 ):
-    """Descarga Excel filtrado por los permisos del usuario."""
     clinicas = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas)
     params = []
@@ -1016,9 +1066,7 @@ def download_excel(
         raise HTTPException(404, "Sin datos para los filtros seleccionados")
 
     df = pd.DataFrame([dict(r) for r in rows])
-    # Renombrar a nombres legibles
     df.rename(columns={v: k for k, v in COL_MAP.items()}, inplace=True)
-    # Ocultar IMPORTE para roles sin permiso (todos ven LIQUIDA)
     if user["rol"] not in ("admin", "directorio"):
         cols_to_drop = [c for c in ["IMPORTE", "IMP2"] if c in df.columns]
         if cols_to_drop:
@@ -1048,17 +1096,16 @@ def download_excel(
 @app.get("/analisis/practicas")
 def get_analisis_practicas(
     periodo: Optional[str] = None,
-    periodos_ids: Optional[str] = Query(None, description="Períodos separados por coma"),
+    periodos_ids: Optional[str] = Query(None),
     clinica: Optional[int] = Query(None),
-    clinicas_ids: Optional[str] = Query(None, description="IDs separados por coma"),
+    clinicas_ids: Optional[str] = Query(None),
     mutual: Optional[int] = Query(None),
-    mutuales_ids: Optional[str] = Query(None, description="IDs separados por coma"),
-    practicas_ids: Optional[str] = Query(None, description="Códigos de práctica separados por coma"),
+    mutuales_ids: Optional[str] = Query(None),
+    practicas_ids: Optional[str] = Query(None),
     tipo: Optional[str] = None,
     top: int = Query(20, le=100),
     user=Depends(get_current_user)
 ):
-    """Prácticas más frecuentes con desglose por prestador y financiador."""
     clinicas_usuario = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas_usuario)
     params = []; where = f"1=1{cf}"; params.extend(cp)
@@ -1066,7 +1113,6 @@ def get_analisis_practicas(
     if tipo:       where += " AND tipo=?";      params.append(tipo.upper())
     where, params = apply_clinica_filter(where, params, clinicas_ids, clinica, clinicas_usuario)
     where, params = apply_mutual_filter(where, params, mutuales_ids, mutual)
-    # Filter by specific practices
     if practicas_ids:
         pids = [x.strip() for x in practicas_ids.split(",") if x.strip()]
         if pids:
@@ -1099,10 +1145,9 @@ def get_evolucion(
     mutual: Optional[int] = Query(None),
     mutuales_ids: Optional[str] = Query(None),
     tipo: Optional[str] = None,
-    agrupar_por: str = Query("prestador", description="prestador | financiador | prestador_financiador"),
+    agrupar_por: str = Query("prestador"),
     user=Depends(get_current_user)
 ):
-    """Evolución de facturación por período, agrupada por prestador/financiador."""
     clinicas_usuario = get_clinicas_usuario(user["id"])
     cf, cp = clinica_filter(clinicas_usuario)
     params = []; where = f"1=1{cf}"; params.extend(cp)
@@ -1117,7 +1162,7 @@ def get_evolucion(
     elif agrupar_por == "financiador":
         group_cols = "periodo, nom_mutual"
         select_cols = "periodo, nom_mutual as etiqueta, '' as etiqueta2"
-    else:  # prestador_financiador
+    else:
         group_cols = "periodo, nom_clinica, nom_mutual"
         select_cols = "periodo, nom_clinica as etiqueta, nom_mutual as etiqueta2"
 
@@ -1133,18 +1178,14 @@ def get_evolucion(
     return [dict(r) for r in rows]
 
 # ─────────────────────────────────────────────────────────────
-# HEALTH CHECK
+# HEALTH / VERSION / ADMIN
 # ─────────────────────────────────────────────────────────────
 @app.get("/version")
 def version():
-    """Endpoint para verificar qué versión está corriendo."""
-    return {"version": "2026-04-17-periodos-ids", "analisis_practicas": "uses apply_clinica_filter + periodos_ids"}
-
-
+    return {"version": "2026-04-20-login-logs-gerentes", "features": ["login_logs", "gerentes_sin_restriccion", "colores_amb_int"]}
 
 @app.get("/admin/check-db", dependencies=[Depends(require_admin)])
 def check_db():
-    """Diagnóstico: lista tablas y columnas de la BD."""
     with db_conn() as c:
         tables = c.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -1158,16 +1199,12 @@ def check_db():
 
 @app.post("/admin/fix-db", dependencies=[Depends(require_admin)])
 def fix_db():
-    """Recrea permisos con FK correcta a usuarios, preservando datos."""
     with db_conn() as c:
-        # Leer permisos existentes para preservarlos
         try:
             existing = c.execute("SELECT usuario_id, clinica_id, nom_clinica FROM permisos").fetchall()
         except Exception:
             existing = []
-        # Borrar tabla permisos con FK rota
         c.execute("DROP TABLE IF EXISTS permisos")
-        # Recrear con FK correcta
         c.execute("""
             CREATE TABLE permisos (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1177,7 +1214,6 @@ def fix_db():
                 UNIQUE(usuario_id, clinica_id)
             )
         """)
-        # Restaurar datos
         for row in existing:
             try:
                 c.execute(
