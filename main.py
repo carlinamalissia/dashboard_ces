@@ -160,6 +160,22 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_logs_fecha ON login_logs(fecha DESC);
         CREATE INDEX IF NOT EXISTS idx_logs_user  ON login_logs(username);
+
+        CREATE TABLE IF NOT EXISTS download_logs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            username     TEXT NOT NULL,
+            ip           TEXT,
+            tipo         TEXT NOT NULL DEFAULT 'excel',
+            periodos     TEXT,
+            clinicas     TEXT,
+            mutuales     TEXT,
+            tipo_prest   TEXT,
+            filas        INTEGER,
+            fecha        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dl_fecha ON download_logs(fecha DESC);
+        CREATE INDEX IF NOT EXISTS idx_dl_user  ON download_logs(username);
         """)
         pwd = _bcrypt.hashpw(ADMIN_PASS[:72].encode(), _bcrypt.gensalt()).decode()
         c.execute("""
@@ -402,6 +418,33 @@ def me(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────
 # LOGIN LOGS (admin only)
 # ─────────────────────────────────────────────────────────────
+@app.get("/admin/download-logs", dependencies=[Depends(require_admin)])
+def get_download_logs(
+    limit: int = Query(200, le=1000),
+    offset: int = 0,
+    username: Optional[str] = None
+):
+    """Registro de descargas de archivos — solo admins."""
+    params = []
+    where = "1=1"
+    if username:
+        where += " AND username LIKE ?"
+        params.append(f"%{username}%")
+    with db_conn() as c:
+        total = c.execute(
+            f"SELECT COUNT(*) FROM download_logs WHERE {where}", params
+        ).fetchone()[0]
+        rows = c.execute(
+            f"SELECT * FROM download_logs WHERE {where} ORDER BY fecha DESC LIMIT ? OFFSET ?",
+            params + [limit, offset]
+        ).fetchall()
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "data": [dict(r) for r in rows]
+    }
+
 @app.get("/admin/login-logs", dependencies=[Depends(require_admin)])
 def get_login_logs(
     limit: int = Query(200, le=1000),
@@ -1083,9 +1126,28 @@ def download_excel(
             ws.set_column(col_num, col_num, max(len(str(col_name)) + 2, 12))
 
     buf.seek(0)
+    excel_bytes = buf.read()
+
+    # Registrar descarga con filtros aplicados (sin datos)
+    periodos_log = periodos_ids or periodo or "todos"
+    clinicas_log = clinicas_ids or (str(clinica) if clinica else "todas")
+    mutuales_log = mutuales_ids or (str(mutual) if mutual else "todas")
+    tipo_log     = tipo or "AMB+INT"
+    try:
+        with db_conn() as c:
+            c.execute(
+                """INSERT INTO download_logs
+                   (username, ip, tipo, periodos, clinicas, mutuales, tipo_prest, filas)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (user["username"], "api", "excel",
+                 periodos_log, clinicas_log, mutuales_log, tipo_log, len(rows))
+            )
+    except Exception:
+        pass  # no bloquear la descarga si falla el log
+
     filename = f"CES_{user['username']}_{periodo or 'todo'}.xlsx"
     return Response(
-        content=buf.read(),
+        content=excel_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
@@ -1182,7 +1244,7 @@ def get_evolucion(
 # ─────────────────────────────────────────────────────────────
 @app.get("/version")
 def version():
-    return {"version": "2026-04-20-login-logs-gerentes", "features": ["login_logs", "gerentes_sin_restriccion", "colores_amb_int"]}
+    return {"version": "2026-04-20-download-logs", "features": ["login_logs", "download_logs", "gerentes_sin_restriccion", "colores_amb_int"]}
 
 @app.get("/admin/check-db", dependencies=[Depends(require_admin)])
 def check_db():
