@@ -297,6 +297,12 @@ def apply_mutual_filter(where: str, params: list, mutuales_ids: Optional[str],
         params.extend(mids)
     return where, params
 
+def now_ar() -> str:
+    """Fecha y hora actual en zona horaria de Argentina (UTC-3, sin DST)."""
+    from datetime import timezone, timedelta
+    AR = timezone(timedelta(hours=-3))
+    return datetime.now(AR).strftime("%Y-%m-%d %H:%M:%S")
+
 def get_client_ip(request: Request) -> str:
     """Extrae la IP real del cliente considerando proxies."""
     forwarded = request.headers.get("X-Forwarded-For")
@@ -381,16 +387,16 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends()):
         motivo = "usuario_no_encontrado" if not u else "password_incorrecto"
         with db_conn() as c:
             c.execute(
-                "INSERT INTO login_logs (username, ip, exito, motivo) VALUES (?,?,0,?)",
-                (form.username, ip, motivo)
+                "INSERT INTO login_logs (username, ip, exito, motivo, fecha) VALUES (?,?,0,?,?)",
+                (form.username, ip, motivo, now_ar())
             )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciales incorrectas")
 
     # Registrar login exitoso
     with db_conn() as c:
         c.execute(
-            "INSERT INTO login_logs (username, ip, exito, motivo) VALUES (?,?,1,'ok')",
-            (u["username"], ip)
+            "INSERT INTO login_logs (username, ip, exito, motivo, fecha) VALUES (?,?,1,'ok',?)",
+            (u["username"], ip, now_ar())
         )
 
     token = make_token({"uid": u["id"], "rol": u["rol"]})
@@ -721,8 +727,8 @@ def upload_excel(
         for p, n in conteo_periodos.items():
             p = str(p).strip()
             c.execute(
-                "INSERT OR REPLACE INTO cargas (periodo, filas, usuario, nombre_archivo) VALUES (?,?,?,?)",
-                (p, int(n), user["username"], file.filename)
+                "INSERT OR REPLACE INTO cargas (periodo, filas, usuario, nombre_archivo, fecha) VALUES (?,?,?,?,?)",
+                (p, int(n), user["username"], file.filename, now_ar())
             )
 
     return {
@@ -1137,10 +1143,10 @@ def download_excel(
         with db_conn() as c:
             c.execute(
                 """INSERT INTO download_logs
-                   (username, ip, tipo, periodos, clinicas, mutuales, tipo_prest, filas)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                   (username, ip, tipo, periodos, clinicas, mutuales, tipo_prest, filas, fecha)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (user["username"], "api", "excel",
-                 periodos_log, clinicas_log, mutuales_log, tipo_log, len(rows))
+                 periodos_log, clinicas_log, mutuales_log, tipo_log, len(rows), now_ar())
             )
     except Exception:
         pass  # no bloquear la descarga si falla el log
